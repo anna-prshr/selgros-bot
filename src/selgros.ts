@@ -1,95 +1,53 @@
 import { chromium, Browser, Page } from "playwright";
+import fs from "fs";
 
 type SelgrosProduct = {
   name: string;
   url?: string;
 };
 
-const VERSION = "SEL_BOT_V4_2026-02-04";
+const VERSION = "SEL_BOT_V5_SESSION_2026-02-04";
 const SHOP_URL = "https://www.selgros.de/shop/products";
+const STORAGE_PATH = "./selgros.storage.json";
 
 function fail(msg: string): never {
   throw new Error(`${VERSION}: ${msg}`);
-}
-
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) fail(`Missing environment variable: ${name}`);
-  return value;
 }
 
 function isAzureLogin(url: string) {
   return url.includes("b2clogin.com");
 }
 
-async function gotoShop(page: Page) {
+function hasStorageFile() {
+  return fs.existsSync(STORAGE_PATH);
+}
+
+async function ensureInShop(page: Page) {
   await page.goto(SHOP_URL, { waitUntil: "domcontentloaded" });
-}
 
-async function doLogin(page: Page) {
-  const username = requireEnv("SELGROS_USERNAME");
-  const password = requireEnv("SELGROS_PASSWORD");
-
-  // Wir sind auf Azure B2C Login
-  const userInput = page
-    .locator('input[type="email"], input[name="loginfmt"], input[autocomplete="username"]')
-    .first();
-
-  await userInput.waitFor({ state: "visible", timeout: 60000 });
-  await userInput.fill(username);
-
-  const nextBtn = page.getByRole("button", { name: /weiter|next|continue/i }).first();
-  if (await nextBtn.isVisible().catch(() => false)) {
-    await nextBtn.click();
-  }
-
-  const passInput = page.locator('input[type="password"], input[name="passwd"]').first();
-  await passInput.waitFor({ state: "visible", timeout: 60000 });
-  await passInput.fill(password);
-
-  const signInBtn = page.getByRole("button", { name: /anmelden|login|sign in/i }).first();
-  await signInBtn.click();
-
-  // Warten bis Redirects durch sind
-  await page.waitForLoadState("domcontentloaded", { timeout: 90000 }).catch(() => {});
-}
-
-async function ensureLoggedInShop(page: Page) {
-  await gotoShop(page);
-
-  // Wenn wir direkt in Azure landen: Login versuchen
   if (isAzureLogin(page.url())) {
-    await doLogin(page);
-    await gotoShop(page);
+    fail(
+      `Not logged in (Azure login). Please create a session first via /auth/save-session. Current URL: ${page.url()}`
+    );
   }
 
-  // Wenn wir immer noch Azure sehen -> Login ist blockiert oder nicht abgeschlossen
-  if (isAzureLogin(page.url())) {
-    fail(`Still on Azure login after login attempt. Current URL: ${page.url()}`);
-  }
-
-  // Wenn wir nicht im Shop sind -> ebenfalls abbrechen
   if (!page.url().includes("/shop/")) {
-    fail(`Not in shop after login attempt. Current URL: ${page.url()}`);
+    fail(`Not in shop. Current URL: ${page.url()}`);
   }
 }
 
 async function searchKeyword(page: Page, keyword: string): Promise<SelgrosProduct[]> {
-  // Falls Selgros uns währenddessen wieder in Azure wirft, sofort abbrechen:
-  if (isAzureLogin(page.url())) {
-    fail(`Redirected back to Azure before search. Current URL: ${page.url()}`);
-  }
+  await ensureInShop(page);
 
   const searchInput = page.locator('input[type="search"]:not([readonly])').first();
 
-  // Wenn das Suchfeld nicht sichtbar ist, prüfen wir auch die URL (oft Redirect)
   try {
     await searchInput.waitFor({ state: "visible", timeout: 15000 });
   } catch {
     if (isAzureLogin(page.url())) {
-      fail(`Redirected back to Azure while waiting for search input. Current URL: ${page.url()}`);
+      fail(`Redirected back to Azure while waiting for search. Current URL: ${page.url()}`);
     }
-    fail(`Search input not visible in shop (maybe cookie banner/store selection). Current URL: ${page.url()}`);
+    fail(`Search input not visible. Possibly cookie banner or store selection. Current URL: ${page.url()}`);
   }
 
   await searchInput.click();
@@ -99,7 +57,7 @@ async function searchKeyword(page: Page, keyword: string): Promise<SelgrosProduc
   await page.waitForTimeout(2000);
 
   if (isAzureLogin(page.url())) {
-    fail(`Redirected back to Azure after pressing Enter. Current URL: ${page.url()}`);
+    fail(`Redirected back to Azure after search. Current URL: ${page.url()}`);
   }
 
   const products: SelgrosProduct[] = [];
@@ -122,13 +80,44 @@ async function searchKeyword(page: Page, keyword: string): Promise<SelgrosProduc
 }
 
 export async function runSelgrosSearch(keywords: string[]) {
+  // Session MUSS existieren
+  if (!hasStorageFile()) {
+    fail("No saved session found. Call /auth/save-session first.");
+  }
+
   const browser: Browser = await chromium.launch({
     headless: true,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
-      "--disable-dev-shm-usage"
-    ]
+    args: ["--no-sandbox", "--disable-dev-shm-usage"]
+  });
+
+  try {
+    const context = await browser.newContext({
+      storageState: STORAGE_PATH,
+      locale: "de-DE",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    });
+
+    const page = await context.newPage();
+
+    const results = [];
+    for (const keyword of keywords) {
+      const products = await searchKeyword(page, keyword);
+      results.push({ keyword, products });
+    }
+    return results;
+  } finally {
+    await browser.close();
+  }
+}
+
+// Wird von /auth/save-session verwendet:
+// Startet einen sichtbaren Browser, du loggst dich einmal ein,
+// dann wird die Session gespeichert.
+export async function saveSelgrosSession(): Promise<{ ok: boolean; message: string }> {
+  const browser: Browser = await chromium.launch({
+    headless: false, // sichtbar!
+    args: ["--no-sandbox", "--disable-dev-shm-usage"]
   });
 
   try {
@@ -139,15 +128,22 @@ export async function runSelgrosSearch(keywords: string[]) {
     });
 
     const page = await context.newPage();
+    await page.goto("https://www.selgros.de/shop", { waitUntil: "domcontentloaded" });
 
-    await ensureLoggedInShop(page);
+    // Du loggst dich im geöffneten Fenster ein.
+    // Danach muss die Shop-Seite erreichbar sein.
+    // Wir warten bis zu 5 Minuten.
+    await page.waitForURL((url) => url.toString().includes("/shop"), { timeout: 300000 });
 
-    const results = [];
-    for (const keyword of keywords) {
-      const products = await searchKeyword(page, keyword);
-      results.push({ keyword, products });
+    // Wenn wir immer noch Azure sehen, war Login nicht fertig
+    if (isAzureLogin(page.url())) {
+      fail("Still on Azure login after manual login. Please complete login in the opened browser.");
     }
-    return results;
+
+    // Session speichern
+    await context.storageState({ path: STORAGE_PATH });
+
+    return { ok: true, message: "Session saved to selgros.storage.json. You can now use /run." };
   } finally {
     await browser.close();
   }
